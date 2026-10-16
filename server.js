@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
+const mongoose = require('mongoose');
 
 const app = express();
 const server = http.createServer(app);
@@ -14,6 +15,29 @@ app.use(express.static(__dirname));
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
+
+// ---------- Database ----------
+mongoose
+  .connect(process.env.MONGODB_URI)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch((err) => console.error('MongoDB connection error:', err.message));
+
+const PlayerSchema = new mongoose.Schema({
+  username: { type: String, unique: true, required: true },
+  x: { type: Number, default: 500 },
+  y: { type: Number, default: 500 },
+  health: { type: Number, default: 100 },
+  temperature: { type: Number, default: 100 },
+  inventory: {
+    wood: { type: Number, default: 0 },
+    stone: { type: Number, default: 0 }
+  }
+});
+
+const PlayerModel = mongoose.model('Player', PlayerSchema);
+
+const MAX_USERNAME_LENGTH = 20;
+const AUTOSAVE_INTERVAL_MS = 30000;
 
 // World / player settings (these match the client's constants)
 const WORLD_WIDTH = 1000;
@@ -106,8 +130,14 @@ const BIOME_ENEMY_TYPES = {
 
 const COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6', '#e67e22', '#1abc9c', '#fd79a8'];
 
-// Every connected player, keyed by socket ID
+// Every logged-in player, keyed by socket ID
 const players = {};
+
+// Usernames currently logged in (or mid-login / mid-save), so one account can't be used twice
+const activeUsernames = new Set();
+
+// Sockets whose login query is still running
+const loginPending = new Set();
 
 // The latest keys each player is holding: { up, down, left, right }
 const inputs = {};
@@ -296,23 +326,121 @@ function projectileHitsStructure(px, py, pradius, s) {
   return (dx * dx + dy * dy) < (pradius * pradius);
 }
 
+// Writes one player's progress to MongoDB. Takes a plain snapshot so it's safe to call
+// after the player has already been removed from `players`.
+async function savePlayer(snapshot) {
+  if (!snapshot || !snapshot.username) return;
+  await PlayerModel.updateOne(
+    { username: snapshot.username },
+    {
+      $set: {
+        x: snapshot.x,
+        y: snapshot.y,
+        health: snapshot.health,
+        temperature: snapshot.temperature,
+        inventory: {
+          wood: snapshot.inventory.wood || 0,
+          stone: snapshot.inventory.stone || 0
+        }
+      }
+    }
+  );
+}
+
+function snapshotPlayer(p) {
+  return {
+    username: p.username,
+    x: p.x,
+    y: p.y,
+    health: p.health,
+    temperature: p.temperature,
+    inventory: { wood: p.inventory.wood, stone: p.inventory.stone }
+  };
+}
+
+// Periodic autosave so a server crash doesn't wipe everyone's recent progress
+setInterval(() => {
+  for (const id in players) {
+    savePlayer(snapshotPlayer(players[id])).catch((err) => {
+      console.error('Autosave failed for ' + players[id].username + ':', err.message);
+    });
+  }
+}, AUTOSAVE_INTERVAL_MS);
+
 io.on('connection', (socket) => {
   console.log('A user connected: ' + socket.id);
 
-  players[socket.id] = {
-    x: SPAWN_X,
-    y: SPAWN_Y,
-    color: COLORS[Math.floor(Math.random() * COLORS.length)],
-    health: PLAYER_MAX_HEALTH,
-    temperature: PLAYER_MAX_TEMPERATURE,
-    inventory: { wood: 0, stone: 0 }
-  };
-  inputs[socket.id] = { up: false, down: false, left: false, right: false };
-  lastShot[socket.id] = 0;
-  enemyHitCooldown[socket.id] = 0;
+  // No player is created here. The socket only joins the game after a successful 'login'.
+
+  socket.on('login', async (data) => {
+    // Ignore repeat logins from the same socket
+    if (players[socket.id] || loginPending.has(socket.id)) return;
+
+    const raw = (data && typeof data === 'object') ? data.username : data;
+    const username = typeof raw === 'string' ? raw.trim() : '';
+
+    if (!username || username.length > MAX_USERNAME_LENGTH) {
+      socket.emit('login_error', 'Username must be 1-' + MAX_USERNAME_LENGTH + ' characters.');
+      return;
+    }
+
+    if (activeUsernames.has(username)) {
+      socket.emit('login_error', 'That username is already in use right now.');
+      return;
+    }
+
+    activeUsernames.add(username);
+    loginPending.add(socket.id);
+
+    try {
+      let doc = await PlayerModel.findOne({ username });
+
+      if (!doc) {
+        doc = new PlayerModel({
+          username,
+          x: SPAWN_X,
+          y: SPAWN_Y,
+          health: PLAYER_MAX_HEALTH,
+          temperature: PLAYER_MAX_TEMPERATURE,
+          inventory: { wood: 0, stone: 0 }
+        });
+        await doc.save();
+      }
+
+      // The player may have closed the tab while the query was running
+      if (!socket.connected) {
+        activeUsernames.delete(username);
+        return;
+      }
+
+      players[socket.id] = {
+        username: doc.username,
+        x: doc.x,
+        y: doc.y,
+        color: COLORS[Math.floor(Math.random() * COLORS.length)],
+        health: doc.health > 0 ? doc.health : PLAYER_MAX_HEALTH,
+        temperature: doc.temperature,
+        inventory: {
+          wood: (doc.inventory && doc.inventory.wood) || 0,
+          stone: (doc.inventory && doc.inventory.stone) || 0
+        }
+      };
+      inputs[socket.id] = { up: false, down: false, left: false, right: false };
+      lastShot[socket.id] = 0;
+      enemyHitCooldown[socket.id] = 0;
+
+      socket.emit('login_success', { username: doc.username });
+    } catch (err) {
+      console.error('Login failed for ' + username + ':', err.message);
+      activeUsernames.delete(username);
+      socket.emit('login_error', 'Could not log in. Please try again.');
+    } finally {
+      loginPending.delete(socket.id);
+    }
+  });
 
   socket.on('movement', (data) => {
-    if (!data) return;
+    if (!data || !players[socket.id]) return;
     inputs[socket.id] = {
       up: !!data.up,
       down: !!data.down,
@@ -454,8 +582,9 @@ io.on('connection', (socket) => {
     p.temperature = PLAYER_MAX_TEMPERATURE;
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     console.log('A user disconnected: ' + socket.id);
+
     for (const npc of npcs) {
       if (npc.ownerId === socket.id) {
         npc.state = 'idle';
@@ -463,10 +592,29 @@ io.on('connection', (socket) => {
         npc.lastShot = 0;
       }
     }
+
+    const p = players[socket.id];
+
+    // Grab their current state first, then remove them from the world right away
+    // so the game loop stops simulating them while the save is in flight.
+    const snapshot = p ? snapshotPlayer(p) : null;
+
     delete players[socket.id];
     delete inputs[socket.id];
     delete lastShot[socket.id];
     delete enemyHitCooldown[socket.id];
+    loginPending.delete(socket.id);
+
+    if (!snapshot) return; // never finished logging in, nothing to save
+
+    try {
+      await savePlayer(snapshot);
+    } catch (err) {
+      console.error('Failed to save ' + snapshot.username + ':', err.message);
+    } finally {
+      // Free the username only after the save lands, so a quick re-login loads fresh data
+      activeUsernames.delete(snapshot.username);
+    }
   });
 });
 
@@ -786,9 +934,10 @@ setInterval(() => {
       if (boss.health <= 0) {
         boss.health = 0;
         boss.active = false;
+        const killer = players[b.owner];
         io.emit(
           'world_event',
-          `THE FINAL SAGA COMPLETE - The Boss has been defeated by ${b.owner}!`
+          `THE FINAL SAGA COMPLETE - The Boss has been defeated by ${killer ? killer.username : b.owner}!`
         );
       }
     }

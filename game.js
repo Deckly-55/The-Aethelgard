@@ -4,6 +4,16 @@ const ctx = canvas.getContext('2d');
 // Connect to the server
 const socket = io();
 
+// Login UI
+const loginOverlay = document.getElementById('loginOverlay');
+const usernameInput = document.getElementById('usernameInput');
+const playButton = document.getElementById('playButton');
+const loginError = document.getElementById('loginError');
+
+// Nothing is drawn and no input is captured until the server says we're in
+let loggedIn = false;
+let gameStarted = false;
+
 // Snapshots sent by the server ~60 times a second
 let serverPlayers = {};
 let serverProjectiles = [];
@@ -40,6 +50,37 @@ socket.on('world_event', (message) => {
     worldEventMessage = '';
     worldEventTimer = null;
   }, WORLD_EVENT_DURATION_MS);
+});
+
+// ---------- Login flow ----------
+function attemptLogin() {
+  const username = usernameInput.value.trim();
+  if (!username) {
+    loginError.textContent = 'Please enter a username.';
+    return;
+  }
+
+  loginError.textContent = '';
+  playButton.disabled = true; // stop spam clicking while we wait for the server
+  socket.emit('login', { username });
+}
+
+playButton.addEventListener('click', attemptLogin);
+
+usernameInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') attemptLogin();
+});
+
+socket.on('login_error', (message) => {
+  loginError.textContent = typeof message === 'string' ? message : 'Login failed.';
+  playButton.disabled = false;
+});
+
+socket.on('login_success', () => {
+  loggedIn = true;
+  loginOverlay.style.display = 'none';
+  usernameInput.blur();
+  startGame();
 });
 
 // World settings
@@ -392,6 +433,7 @@ function isNearCampfire(x, y) {
 const keys = { w: false, a: false, s: false, d: false };
 
 function sendMovement() {
+  if (!loggedIn) return;
   socket.emit('movement', {
     up: keys.w,
     down: keys.s,
@@ -401,6 +443,8 @@ function sendMovement() {
 }
 
 window.addEventListener('keydown', (e) => {
+  // Don't capture anything (so the username box works normally) until logged in
+  if (!loggedIn) return;
 
   const key = e.key.toLowerCase();
   if (key in keys) keys[key] = true;
@@ -429,6 +473,7 @@ window.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('keyup', (e) => {
+  if (!loggedIn) return;
   const key = e.key.toLowerCase();
   if (key in keys) keys[key] = false;
 });
@@ -448,6 +493,7 @@ function updateMouse(e) {
 window.addEventListener('mousemove', updateMouse);
 
 canvas.addEventListener('mousedown', (e) => {
+  if (!loggedIn) return;
   if (e.button !== 0) return;
   updateMouse(e);
 
@@ -895,4 +941,12 @@ function gameLoop(now) {
   requestAnimationFrame(gameLoop);
 }
 
-requestAnimationFrame(gameLoop);
+// The loop only starts once login_success arrives
+function startGame() {
+  if (gameStarted) return;
+  gameStarted = true;
+
+  for (const k in keys) keys[k] = false;
+  lastTime = performance.now();
+  requestAnimationFrame(gameLoop);
+}

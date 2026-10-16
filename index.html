@@ -9,6 +9,16 @@
 <body>
   <canvas id="gameCanvas"></canvas>
 
+  <!-- Login overlay: covers the whole screen until the server confirms the login -->
+  <div id="loginOverlay">
+    <div id="loginBox">
+      <h1>Survival.io</h1>
+      <input id="usernameInput" type="text" placeholder="Username" maxlength="20" autocomplete="off" autofocus>
+      <button id="playButton">Play Game</button>
+      <p id="loginError"></p>
+    </div>
+  </div>
+
   <!-- Socket.io client, served automatically by the Socket.io server -->
   <script src="/socket.io/socket.io.js"></script>
 
